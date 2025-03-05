@@ -3,7 +3,13 @@ package MyShortcuts.portlet;
 import MyShortcuts.constants.MyShortcutsPortletKeys;
 import MyShortcuts.model.MyShortcuts;
 import MyShortcuts.model.impl.MyShortcutsImpl;
+import MyShortcuts.service.MyShortcutsLocalService;
 
+import com.liferay.portal.kernel.dao.jdbc.DataAccess;
+import com.liferay.portal.kernel.exception.PortalException;
+import com.liferay.portal.kernel.exception.SystemException;
+import com.liferay.portal.kernel.log.Log;
+import com.liferay.portal.kernel.log.LogFactoryUtil;
 import com.liferay.portal.kernel.portlet.bridges.mvc.MVCPortlet;
 import com.liferay.portal.kernel.servlet.SessionErrors;
 import com.liferay.portal.kernel.theme.ThemeDisplay;
@@ -13,22 +19,23 @@ import com.liferay.portal.kernel.util.Validator;
 import com.liferay.portal.kernel.util.WebKeys;
 
 import java.io.IOException;
+import java.sql.Connection;
+import java.sql.DatabaseMetaData;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicLong;
 
 import javax.portlet.ActionRequest;
 import javax.portlet.ActionResponse;
 import javax.portlet.Portlet;
 import javax.portlet.PortletException;
-import javax.portlet.PortletSession;
 import javax.portlet.RenderRequest;
 import javax.portlet.RenderResponse;
 
+import org.osgi.service.component.annotations.Activate;
 import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Reference;
 
 /**
  * @author alin
@@ -49,75 +56,189 @@ import org.osgi.service.component.annotations.Component;
 )
 public class MyShortcutsPortlet extends MVCPortlet {
     
+    private static final Log _log = LogFactoryUtil.getLog(MyShortcutsPortlet.class);
+    
     protected String addNewShortcutJSP = "/html/my-shortcuts/edit_shortcut.jsp";
     protected String viewShortcutJSP = "/html/my-shortcuts/view.jsp";
     
-    // Constants for session attributes
-    private static final String SHORTCUTS_MAP_KEY = "MY_SHORTCUTS_MAP";
-    private static final String SHORTCUTS_ID_COUNTER_KEY = "MY_SHORTCUTS_ID_COUNTER";
+    // Flag to track whether we've tried to add sample data
+    private boolean sampleDataChecked = false;
+    
+    private static final String TABLE_NAME = "Marketplace_MyShortcuts";
+    private static final String DROP_TABLE_SQL = "DROP TABLE IF EXISTS " + TABLE_NAME;
+    private static final String CHECK_TABLE_EXISTS = "SELECT COUNT(*) FROM " + TABLE_NAME;
+    private static final String COUNT_USER_SHORTCUTS = "SELECT COUNT(*) FROM " + TABLE_NAME + " WHERE userId = ?";
+    private static final String CREATE_TABLE_SQL = 
+            "CREATE TABLE " + TABLE_NAME + " (" +
+            "linkId BIGINT NOT NULL PRIMARY KEY, " +
+            "scopeGroupId BIGINT, " +
+            "userId BIGINT, " +
+            "linkTitle VARCHAR(75) NULL, " +
+            "linkUrl VARCHAR(75) NULL, " +
+            "createDate DATETIME NULL, " +
+            "modifiedDate DATETIME NULL)";
+    
+    @Reference
+    private volatile MyShortcutsLocalService myShortcutsLocalService;
+    
+    @Activate
+    protected void activate() {
+        _log.info("MyShortcutsPortlet activated. Checking table existence...");
+        checkTableAndInitialize();
+    }
     
     /**
-     * Initialize or get the current shortcuts map from the session
+     * Checks if the shortcuts table exists and creates it if it doesn't.
      */
-    private Map<Long, MyShortcuts> getShortcutsMap(PortletSession session) {
-        @SuppressWarnings("unchecked")
-        Map<Long, MyShortcuts> shortcutsMap = (Map<Long, MyShortcuts>) session.getAttribute(
-            SHORTCUTS_MAP_KEY, PortletSession.APPLICATION_SCOPE);
+    protected void checkTableAndInitialize() {
+        Connection con = null;
+        PreparedStatement ps = null;
+        ResultSet rs = null;
+        boolean tableExists = false;
         
-        if (shortcutsMap == null) {
-            // Create and populate with mock data if not exists
-            shortcutsMap = new ConcurrentHashMap<>();
+        try {
+            // Get connection to database
+            con = DataAccess.getConnection();
             
-            // Add mock data
-            addMockShortcut(shortcutsMap, 1L, "https://www.google.com", "Google Search");
-            addMockShortcut(shortcutsMap, 2L, "https://www.github.com", "GitHub");
-            addMockShortcut(shortcutsMap, 3L, "https://www.stackoverflow.com", "Stack Overflow");
-            addMockShortcut(shortcutsMap, 4L, "https://www.liferay.com", "Liferay Portal");
-            addMockShortcut(shortcutsMap, 5L, "https://www.osgi.org", "OSGi Alliance");
+            // First try to query the table to see if it exists and is accessible
+            try {
+                ps = con.prepareStatement(CHECK_TABLE_EXISTS);
+                rs = ps.executeQuery();
+                // If we get here without exception, the table exists
+                _log.info("Table " + TABLE_NAME + " exists and is accessible.");
+                tableExists = true;
+                DataAccess.cleanUp(null, ps, rs);
+            } catch (Exception e) {
+                // Table likely doesn't exist or has issues
+                _log.info("Table " + TABLE_NAME + " doesn't exist or has issues: " + e.getMessage());
+                tableExists = false;
+                DataAccess.cleanUp(null, ps, rs);
+            }
             
-            // Store in session
-            session.setAttribute(SHORTCUTS_MAP_KEY, shortcutsMap, PortletSession.APPLICATION_SCOPE);
-            session.setAttribute(SHORTCUTS_ID_COUNTER_KEY, new AtomicLong(6L), PortletSession.APPLICATION_SCOPE);
+            if (!tableExists) {
+                // Table doesn't exist or has issues, create/recreate it
+                try {
+                    // Try to drop the table first in case it exists but has issues
+                    ps = con.prepareStatement(DROP_TABLE_SQL);
+                    ps.executeUpdate();
+                    DataAccess.cleanUp(null, ps, null);
+                    _log.info("Dropped existing table if it existed.");
+                } catch (Exception e) {
+                    // Ignore errors here as the table might not exist
+                    DataAccess.cleanUp(null, ps, null);
+                }
+                
+                // Create the table
+                ps = con.prepareStatement(CREATE_TABLE_SQL);
+                ps.executeUpdate();
+                _log.info("Table " + TABLE_NAME + " created successfully.");
+            }
+            
+        } catch (Exception e) {
+            _log.error("Error checking/creating table: " + e.getMessage(), e);
+        } finally {
+            DataAccess.cleanUp(con, ps, rs);
+        }
+    }
+    
+    /**
+     * Adds sample shortcuts for a user if they don't have any
+     */
+    protected void addSampleShortcutsIfEmpty(long userId, long scopeGroupId) {
+        if (sampleDataChecked) {
+            return; // Already checked/added sample data for this portlet instance
         }
         
-        return shortcutsMap;
-    }
-    
-    /**
-     * Get the ID counter for generating new IDs
-     */
-    private AtomicLong getIdCounter(PortletSession session) {
-        AtomicLong counter = (AtomicLong) session.getAttribute(
-            SHORTCUTS_ID_COUNTER_KEY, PortletSession.APPLICATION_SCOPE);
+        Connection con = null;
+        PreparedStatement ps = null;
+        ResultSet rs = null;
+        boolean hasShortcuts = false;
         
-        if (counter == null) {
-            counter = new AtomicLong(1L);
-            session.setAttribute(SHORTCUTS_ID_COUNTER_KEY, counter, PortletSession.APPLICATION_SCOPE);
+        try {
+            // Get connection to database
+            con = DataAccess.getConnection();
+            
+            // Check if user has any shortcuts
+            ps = con.prepareStatement(COUNT_USER_SHORTCUTS);
+            ps.setLong(1, userId);
+            rs = ps.executeQuery();
+            
+            if (rs.next()) {
+                hasShortcuts = (rs.getInt(1) > 0);
+            }
+            
+            if (!hasShortcuts) {
+                _log.info("User " + userId + " has no shortcuts. Adding sample data.");
+                
+                // Explicitly add sample shortcuts
+                try {
+                    // Add Google
+                    myShortcutsLocalService.addMyShortcuts(userId, scopeGroupId, 
+                            "https://www.google.com", "Google Search");
+                    _log.info("Added Google shortcut for user " + userId);
+                    
+                    // Add GitHub
+                    myShortcutsLocalService.addMyShortcuts(userId, scopeGroupId, 
+                            "https://www.github.com", "GitHub");
+                    _log.info("Added GitHub shortcut for user " + userId);
+                    
+                    // Add Liferay
+                    myShortcutsLocalService.addMyShortcuts(userId, scopeGroupId, 
+                            "https://www.liferay.com", "Liferay");
+                    _log.info("Added Liferay shortcut for user " + userId);
+                    
+                    // Add Stack Overflow
+                    myShortcutsLocalService.addMyShortcuts(userId, scopeGroupId, 
+                            "https://stackoverflow.com", "Stack Overflow");
+                    _log.info("Added Stack Overflow shortcut for user " + userId);
+                    
+                    // Add YouTube
+                    myShortcutsLocalService.addMyShortcuts(userId, scopeGroupId, 
+                            "https://www.youtube.com", "YouTube");
+                    _log.info("Added YouTube shortcut for user " + userId);
+                    
+                    _log.info("ALL Sample shortcuts added for user " + userId);
+                } catch (Exception e) {
+                    _log.error("Error adding sample shortcuts: " + e.getMessage(), e);
+                }
+            } else {
+                _log.info("User " + userId + " already has " + rs.getInt(1) + " shortcuts.");
+            }
+        } catch (Exception e) {
+            _log.error("Error checking user shortcuts: " + e.getMessage(), e);
+        } finally {
+            DataAccess.cleanUp(con, ps, rs);
+            sampleDataChecked = true; // Mark as checked regardless of outcome
         }
-        
-        return counter;
     }
     
-    /**
-     * Helper method to add a mock shortcut
-     */
-    private void addMockShortcut(Map<Long, MyShortcuts> map, Long id, String url, String title) {
-        MyShortcuts shortcut = new MyShortcutsImpl();
-        shortcut.setPrimaryKey(id);
-        shortcut.setLinkUrl(url);
-        shortcut.setLinkTitle(title);
-        map.put(id, shortcut);
-    }
-    
+   
     @Override
     public void render(RenderRequest renderRequest, RenderResponse renderResponse) 
             throws PortletException, IOException {
         
-        Map<Long, MyShortcuts> shortcutsMap = getShortcutsMap(renderRequest.getPortletSession());
+        ThemeDisplay themeDisplay = (ThemeDisplay)renderRequest.getAttribute(WebKeys.THEME_DISPLAY);
         
-        // Convert map to list for easier rendering in JSP
-        List<MyShortcuts> shortcutsList = new ArrayList<>(shortcutsMap.values());
-        renderRequest.setAttribute("shortcutsList", shortcutsList);
+        try {
+            // Check if user has shortcuts and add sample data if necessary
+            if (themeDisplay != null && themeDisplay.isSignedIn()) {
+                addSampleShortcutsIfEmpty(themeDisplay.getUserId(), themeDisplay.getScopeGroupId());
+            }
+            
+            // Get shortcuts for the current user and scope group
+            List<MyShortcuts> shortcutsList = myShortcutsLocalService.getShortcutsByG_U(
+                themeDisplay.getUserId(), themeDisplay.getScopeGroupId());
+            
+            // Make the list empty button available if no shortcuts exist
+            renderRequest.setAttribute("hasShortcuts", !shortcutsList.isEmpty());
+            renderRequest.setAttribute("shortcutsList", shortcutsList);
+            _log.debug("Retrieved " + shortcutsList.size() + " shortcuts for user " + themeDisplay.getUserId());
+        } catch (SystemException e) {
+            // Log error and provide empty list in case of failure
+            _log.error("Error retrieving shortcuts: " + e.getMessage(), e);
+            renderRequest.setAttribute("shortcutsList", new ArrayList<MyShortcuts>());
+            renderRequest.setAttribute("hasShortcuts", false);
+        }
         
         super.render(renderRequest, renderResponse);
     }
@@ -129,6 +250,7 @@ public class MyShortcutsPortlet extends MVCPortlet {
         MyShortcuts myLink = new MyShortcutsImpl();
         actionRequest.setAttribute("myLink", myLink); 
         actionResponse.setRenderParameter("jspPage", addNewShortcutJSP);
+        _log.debug("Navigating to add new shortcut page");
     }
     
     /**
@@ -142,72 +264,30 @@ public class MyShortcutsPortlet extends MVCPortlet {
         String linkUrl = ParamUtil.getString(actionRequest, "url");
         
         long linkId = ParamUtil.getLong(actionRequest, "linkId");
+        long groupId = themeDisplay.getScopeGroupId();
+        long userId = themeDisplay.getUserId();
         
-        // Debug information
-        System.out.println("saveNewShortcut called with:");
-        System.out.println("  linkId: " + linkId);
-        System.out.println("  linkTitle: " + linkTitle);
-        System.out.println("  linkUrl: " + linkUrl);
+        _log.debug("Saving shortcut - Title: " + linkTitle + ", URL: " + linkUrl + ", ID: " + linkId);
         
         ArrayList<String> errors = new ArrayList<String>();
             
         if (validateLinks(linkUrl, linkTitle, errors)) {
-            PortletSession session = actionRequest.getPortletSession();
-            Map<Long, MyShortcuts> shortcutsMap = getShortcutsMap(session);
             
             if (Validator.isNull(linkId) || linkId == 0) {
                 // Add new shortcut
                 linkUrl = checkURL(linkUrl);
-                
-                // Generate new ID
-                AtomicLong counter = getIdCounter(session);
-                long newId = counter.getAndIncrement();
-                
-                MyShortcuts newShortcut = new MyShortcutsImpl();
-                newShortcut.setPrimaryKey(newId);
-                newShortcut.setLinkUrl(linkUrl);
-                newShortcut.setLinkTitle(linkTitle);
-                
-                // Add to map
-                shortcutsMap.put(newId, newShortcut);
-                
+                myShortcutsLocalService.addMyShortcuts(userId, groupId, linkUrl, linkTitle);
                 actionRequest.setAttribute("link-saved-successfully", "link-saved-successfully");
-                System.out.println("New shortcut created with ID: " + newId);
+                _log.info("New shortcut added: " + linkTitle);
             } else {
                 // Update existing shortcut
-                MyShortcuts existingShortcut = shortcutsMap.get(linkId);
-                
-                if (existingShortcut != null) {
-                    linkUrl = checkURL(linkUrl);
-                    existingShortcut.setLinkUrl(linkUrl);
-                    existingShortcut.setLinkTitle(linkTitle);
-                    
-                    // Update in map
-                    shortcutsMap.put(linkId, existingShortcut);
-                    
-                    actionRequest.setAttribute("link-updated-successfully", "link-updated-successfully");
-                    System.out.println("Shortcut updated with ID: " + linkId);
-                } else {
-                    System.out.println("Failed to find shortcut with ID: " + linkId);
-                }
+                linkUrl = checkURL(linkUrl);
+                myShortcutsLocalService.updateMyShortcuts(linkId, linkUrl, linkTitle);
+                actionRequest.setAttribute("link-updated-successfully", "link-updated-successfully");
+                _log.info("Shortcut updated: " + linkTitle + " [ID: " + linkId + "]");
             }
             
-            // Explicitly set the render parameter to go back to the view page
-            actionResponse.setRenderParameter("jspPage", "/html/my-shortcuts/view.jsp");
-            
-            // Only try to redirect if we have ThemeDisplay
-            if (themeDisplay != null) {
-                try {
-                    actionResponse.sendRedirect(PortalUtil.getLayoutURL(themeDisplay));
-                } catch (Exception e) {
-                    System.out.println("Failed to redirect: " + e.getMessage());
-                    // Fallback to render parameter if redirect fails
-                    actionResponse.setRenderParameter("jspPage", "/html/my-shortcuts/view.jsp");
-                }
-            } else {
-                System.out.println("ThemeDisplay is null, using render parameter instead");
-                actionResponse.setRenderParameter("jspPage", "/html/my-shortcuts/view.jsp");
-            }
+            actionResponse.sendRedirect(PortalUtil.getLayoutURL(themeDisplay));
         } else {
             // Validation failed
             MyShortcuts myLink = new MyShortcutsImpl();
@@ -217,9 +297,9 @@ public class MyShortcutsPortlet extends MVCPortlet {
             
             for (String error : errors) {
                 SessionErrors.add(actionRequest, error);
+                _log.debug("Validation error: " + error);
             }
-            actionResponse.setRenderParameter("jspPage", "/html/my-shortcuts/edit_shortcut.jsp");
-            System.out.println("Validation failed, staying on edit page");
+            actionResponse.setRenderParameter("jspPage", addNewShortcutJSP);
         }
     }
     
@@ -231,17 +311,17 @@ public class MyShortcutsPortlet extends MVCPortlet {
         ThemeDisplay themeDisplay =
             (ThemeDisplay)actionRequest.getAttribute(WebKeys.THEME_DISPLAY);
         
+        _log.debug("Deleting shortcut with ID: " + linkIdStr);
+        
         if (Validator.isNotNull(linkIdStr)) {
             try {
                 long linkId = Long.parseLong(linkIdStr);
-                
-                // Remove from map
-                Map<Long, MyShortcuts> shortcutsMap = getShortcutsMap(actionRequest.getPortletSession());
-                shortcutsMap.remove(linkId);
-                
+                myShortcutsLocalService.deleteMyShortcuts(linkId);
                 actionRequest.setAttribute("link-deleted-successfully", "link-deleted-successfully");
+                _log.info("Shortcut deleted: " + linkId);
             } catch (Exception ex) {
                 actionRequest.setAttribute("link-not-deleted-successfully", "link-not-deleted-successfully");
+                _log.error("Error deleting shortcut: " + ex.getMessage(), ex);
             }
             
             actionResponse.sendRedirect(PortalUtil.getLayoutURL(themeDisplay));
@@ -254,35 +334,21 @@ public class MyShortcutsPortlet extends MVCPortlet {
     /**
      * Edit an existing shortcut
      */
-    /**
-     * Edit an existing shortcut
-     */
     public void editShortcut(ActionRequest actionRequest, ActionResponse actionResponse) throws Exception {
         long linkId = ParamUtil.getLong(actionRequest, "linkId");
         
-        if (Validator.isNotNull(linkId)) {
-            Map<Long, MyShortcuts> shortcutsMap = getShortcutsMap(actionRequest.getPortletSession());
-            MyShortcuts myLink = shortcutsMap.get(linkId);
-            
-            if (myLink != null) {
-                // Set the myLink object as a request attribute
+        _log.debug("Editing shortcut with ID: " + linkId);
+        
+        if (Validator.isNotNull(linkId)) { 
+            try {
+                MyShortcuts myLink = myShortcutsLocalService.getMyShortcuts(linkId);
                 actionRequest.setAttribute("myLink", myLink);
-                
-                // Set the render parameter to navigate to the edit page
-                actionResponse.setRenderParameter("jspPage", "/html/my-shortcuts/edit_shortcut.jsp");
-                
-                // Debug info
-                System.out.println("Editing shortcut with ID: " + linkId);
-                System.out.println("Setting jspPage to: " + "/html/my-shortcuts/edit_shortcut.jsp");
-            } else {
-                // Handle case where shortcut is not found
-                System.out.println("Shortcut with ID " + linkId + " not found");
-                actionResponse.setRenderParameter("jspPage", "/html/my-shortcuts/view.jsp");
+                actionResponse.setRenderParameter("jspPage", addNewShortcutJSP);
+                _log.debug("Retrieved shortcut for editing: " + myLink.getLinkTitle());
+            } catch (PortalException e) {
+                _log.error("Error retrieving shortcut with ID " + linkId + ": " + e.getMessage(), e);
+                actionResponse.setRenderParameter("jspPage", viewShortcutJSP);
             }
-        } else {
-            // Handle case where linkId is not provided
-            System.out.println("No linkId provided for editing");
-            actionResponse.setRenderParameter("jspPage", "/html/my-shortcuts/view.jsp");
         }
     }
     
@@ -310,7 +376,7 @@ public class MyShortcutsPortlet extends MVCPortlet {
     
     private String checkURL(String url) {
         if (!url.startsWith("http://") && !url.startsWith("https://")) {
-            return "https://" + url;
+            return "http://" + url;
         }
         return url;
     }
