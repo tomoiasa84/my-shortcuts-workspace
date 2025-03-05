@@ -1,0 +1,7 @@
+Bundle-Name: MyShortcuts
+Bundle-SymbolicName: MyShortcuts
+Bundle-Version: 1.0.0
+Export-Package: MyShortcuts.constants
+Provide-Capability:\
+	liferay.language.resources;\
+		resource.bundle.base.name="content.Language"
