@@ -5,7 +5,6 @@ package MyShortcuts.constants;
  */
 public class MyShortcutsPortletKeys {
 
-	public static final String MYSHORTCUTS =
-		"MyShortcuts_MyShortcutsPortlet";
+    public static final String MYSHORTCUTS = "MyShortcuts";
 
 }
